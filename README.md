@@ -1,9 +1,14 @@
 # PARE: PARE's Accelerated Runtime Elimination 🔪🔥
   _____             _____   ______ 
+  
  |  __ \     /\    |  __ \ |  ____|
+ 
  | |__) |   /  \   | |__) || |__   
+ 
  |  ___/   / /\ \  |  _  / |  __|  
+ 
  | |      / ____ \ | | \ \ | |____ 
+ 
  |_|     /_/    \_\|_|  \_\|______|
                                    
   PARE's Accelerated Runtime Elimination
