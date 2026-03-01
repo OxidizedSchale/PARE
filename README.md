@@ -1,4 +1,7 @@
 # PARE: PARE's Accelerated Runtime Elimination 🔪🔥
+
+# Warning! The current PARE program is still in the beta version, please do not use our program to handle important work code!
+# 警告！目前的 PARE 程序仍处于内测版，请先不要拿我们的程序去处理重要工作代码！
   
                                   
   PARE's Accelerated Runtime Elimination
