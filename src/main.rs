@@ -9,6 +9,8 @@
  * 许可证: GNU General Public License v3.0
  */
 
+#![allow(warings)] ///全局禁用rust的大傻福警告
+     
 use eframe::egui;
 use std::collections::HashMap;
 use std::path::PathBuf;
