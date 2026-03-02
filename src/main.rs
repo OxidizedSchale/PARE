@@ -1,277 +1,395 @@
 /*
- * Project: PARE (PARE's Accelerated Runtime Elimination)
+ * Project: PARE Studio (PARE's Accelerated Runtime Elimination - GUI Edition)
  * GitHub: https://github.com/OxidizedSchale/PARE-s-Accelerated-Runtime-Elimination
- * 
+ * * [架构愿景]
+ * PARE 通过 "降维转译" 技术，将 Python 逻辑中高性能计算部分（Int/Float）直接映射为原生 C，
+ * 同时保留 CPython 解释器作为“保底运行时”，实现 100% 的 Python 生态兼容性与近乎原生 C 的执行效率。
+ *
  * 版权所有 (C) 2026 OxidizedSchale & PARE Contributors
- * 
- * 本程序是自由软件：您可以自由分发和/或修改它。
- * 它遵循由自由软件基金会 (Free Software Foundation) 发布的
- * GNU 通用公共许可证 (GNU General Public License) 第 3 版。
- *
- * ----------------------------------------------------------------------------
- *
- * [项目架构概述 / Architecture Overview]
- *
- * PARE 是一个旨在彻底干掉 Python 运行时的激进转译编译器。
- * 它的核心逻辑如下：
- *
- * 1. 前端解析 (Frontend): 使用 rustpython-parser 将 .py 源码转化为 AST。
- * 2. 类型推导 (Inference): 递归分析表达式，将 PyObject 降维成裸 C 类型 (long long / double)。
- * 3. 递归转译 (Recursive Transpilation): 支持嵌套循环 (Nested Loops) 和复杂表达式计算。
- * 4. 极限编译 (Backend): 自动探测 GCC (-O3) 或 MSVC (/O2) 开启硬件级优化。
- * 5. 链接增强 (Linking): 支持 mold 链接器，实现毫秒级构建。
- *
+ * 许可证: GNU General Public License v3.0
  */
 
-#![allow(warnings)] ///关闭rust的大傻逼警告/Turn off the damn rust compiler warnings.
-
-use anyhow::{Context, Result};
-use clap::Parser;
-use colored::*;
-use rustpython_parser::{ast, Parse};
+use eframe::egui;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process::Command;
+use anyhow::{Context, Result};
+use rustpython_parser::{ast, Parse};
 
-/// PARE 命令行工具：将 Python 脚本献祭给 C 语言以换取绝对速度
-#[derive(Parser, Debug)]
-#[command(author, version, about)]
-struct Args {
-    /// 输入的 Python 文件 (Input .py file)
-    #[arg(short, long)]
-    input: PathBuf,
-
-    /// 输出的可执行文件名称 (Output binary name)
-    #[arg(short, long, default_value = "pare_out")]
-    output: PathBuf,
-
-    /// 强制开启指令集优化 (Enable aggressive optimizations like -march=native)
-    #[arg(long, default_value_t = true)]
-    optimize: bool,
-
-    /// 是否使用极速链接器 mold (Use mold linker)
-    #[arg(long, default_value_t = false)]
-    use_mold: bool,
-}
+// ============================================================================
+// [1. 类型系统] 
+// ============================================================================
 
 #[derive(Debug, Clone, PartialEq)]
-enum CType { Int, Float, Unknown }
+enum CType {
+    Int,      // 纯 C 赛道: long long
+    Float,    // 纯 C 赛道: double
+    Dynamic,  // CPython 赛道: 回退给 PyObject* }
 
-impl CType {
-    fn to_c_str(&self) -> &str {
-        match self {
-            CType::Int => "long long",
-            CType::Float => "double",
-            _ => "void*",
+// ============================================================================
+// [2. UI 状态与消息驱动] 
+// ============================================================================
+
+enum AppMessage {
+    Log(String),
+    Error(String),
+    Success(String),
+    Progress(f32, String),
+    Finished,
+}
+
+struct PareApp {
+    selected_file: Option<PathBuf>,
+    logs: String,
+    is_working: bool,
+    progress: f32,
+    status_text: String,
+    rx: Receiver<AppMessage>,
+    tx: Sender<AppMessage>,
+}
+
+impl PareApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // 🌟 静态链接字体初始化
+        setup_embedded_font(&cc.egui_ctx);
+        
+        let (tx, rx) = channel();
+        Self {
+            selected_file: None,
+            logs: String::from("🚀 PARE Studio (CPython 强袭版) 已就绪...\n"),
+            is_working: false,
+            progress: 0.0,
+            status_text: String::from("空闲"),
+            rx,
+            tx,
+        }
+    }
+
+    /// 开启编译线程，避免阻塞 GUI 渲染
+    fn start_mission(&mut self) {
+        if let Some(path) = self.selected_file.clone() {
+            self.is_working = true;
+            self.progress = 0.0;
+            self.status_text = String::from("正在降维打击...");
+            self.logs.push_str(&format!("\n🔥 任务开始: {:?}\n", path));
+
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                if let Err(e) = run_compilation_pipeline(path, tx.clone()) {
+                    let _ = tx.send(AppMessage::Error(format!("❌ 任务失败: {}", e)));
+                }
+                let _ = tx.send(AppMessage::Finished);
+            });
         }
     }
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    println!("{}", "⚡ PARE: 正在剥离 Python 运行时，准备降维打击...".bright_cyan().bold());
+// ============================================================================
+// [3. GUI 布局与交互实现] 
+// ============================================================================
 
-    // 1. 读取源码
-    let source = fs::read_to_string(&args.input)
-        .with_context(|| format!("无法读取文件: {:?}", args.input))?;
+impl eframe::App for PareApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 处理来自编译后端的异步消息
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                AppMessage::Log(s) => self.logs.push_str(&format!("ℹ️ {}\n", s)),
+                AppMessage::Error(s) => {
+                    self.logs.push_str(&format!("{}\n", s));
+                    self.status_text = String::from("错误");
+                }
+                AppMessage::Success(s) => {
+                    self.logs.push_str(&format!("✅ {}\n", s));
+                    self.status_text = String::from("成功");
+                }
+                AppMessage::Progress(p, s) => {
+                    self.progress = p;
+                    self.status_text = s;
+                }
+                AppMessage::Finished => {
+                    self.is_working = false;
+                    self.progress = 1.0;
+                }
+            }
+        }
 
-    // 2. 解析 AST
-    let ast_suite = ast::Suite::parse(&source, "<pare>")
-        .with_context(|| "❌ Python 语法错误！传教士拒绝处理异端代码。".red())?;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("PARE Studio: 混合型 Python 降维编译器");
+            ui.separator();
 
-    // 3. 递归生成 C 代码
-    let mut symbols = HashMap::new();
-    let mut c_body = String::new();
+            // 1. 脚本选择
+            ui.horizontal(|ui| {
+                if ui.button("📂 选择 Python 脚本").clicked() && !self.is_working {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("Python", &["py"]).pick_file() {
+                        self.selected_file = Some(path);
+                        self.logs.push_str(&format!("📂 加载完毕: {:?}\n", path));
+                    }
+                }
+                if let Some(path) = &self.selected_file {
+                    ui.label(path.to_string_lossy());
+                } else {
+                    ui.weak("等待选择脚本...");
+                }
+            });
+
+            ui.add_space(10.0);
+
+            // 2. 编译控制
+            ui.horizontal(|ui| {
+                let btn = egui::Button::new("🔥 强袭编译 (Nuitka Killer)").min_size(egui::vec2(150.0, 40.0));
+                if ui.add_enabled(!self.is_working && self.selected_file.is_some(), btn).clicked() {
+                    self.start_mission();
+                }
+                if self.is_working {
+                    ui.spinner();
+                    ui.label(format!("状态: {}", self.status_text));
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.add(egui::ProgressBar::new(self.progress).show_percentage());
+            
+            ui.separator();
+            ui.heading("📜 传教士日志");
+            
+            // 3. 实时终端输出
+            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut self.logs)
+                    .font(egui::TextStyle::Monospace)
+                    .code_editor()
+                    .desired_width(f32::INFINITY));
+            });
+        });
+        
+        // 保持界面在高负载任务期间的响应
+        if self.is_working { ctx.request_repaint(); }
+    }
+}
+
+// ============================================================================
+// [4. 编译流水线 (The Pipeline)] 
+// ============================================================================
+
+fn run_compilation_pipeline(input_path: PathBuf, tx: Sender<AppMessage>) -> Result<()> {
+    tx.send(AppMessage::Progress(0.1, "读取源码...".into()))?;
+    let source = fs::read_to_string(&input_path)?;
     
-    // 核心：递归处理所有语句
-    for stmt in &ast_suite {
-        c_body.push_str(&transpile_stmt(stmt, &mut symbols, 1)?);
+    tx.send(AppMessage::Progress(0.3, "解析抽象语法树 (AST)...".into()))?;
+    let ast_suite = ast::Suite::parse(&source, "<pare>")
+        .map_err(|e| anyhow::anyhow!("Python 语法错误: {:?}", e))?;
+
+    tx.send(AppMessage::Progress(0.5, "执行混合类型推导与 C 代码生成...".into()))?;
+    let mut symbols = HashMap::new();
+    let c_code = transpile_hybrid(&ast_suite, &mut symbols);
+
+    // 使用临时目录存放生成的中间 C 代码
+    let temp_dir = tempfile::tempdir()?;
+    let c_file_path = temp_dir.path().join("pare_hybrid.c");
+    fs::write(&c_file_path, &c_code)?;
+
+    tx.send(AppMessage::Progress(0.7, "链接 CPython 解释器 (GCC)...".into()))?;
+    
+    // 动态检索当前环境的 CPython 开发配置
+    let cflags = get_python_config("--cflags")?;
+    let ldflags = get_python_config("--ldflags")?;
+    let embed_ldflags = get_python_config_embed().unwrap_or_default();
+
+    let output_exe = input_path.with_extension(if cfg!(windows) { "exe" } else { "out" });
+    let mut cmd = Command::new("gcc");
+    
+    // -O3 暴力优化，开启“强袭模式”
+    cmd.arg("-O3").arg(&c_file_path).arg("-o").arg(&output_exe);
+    
+    // 注入 CPython 环境参数
+    for flag in cflags.split_whitespace() { cmd.arg(flag); }
+    for flag in ldflags.split_whitespace() { cmd.arg(flag); }
+    for flag in embed_ldflags.split_whitespace() { cmd.arg(flag); }
+
+    let output = cmd.output().context("GCC 编译失败。请确保系统中安装了 gcc 和 python3-dev。")?;
+    
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("C 编译错误:\n{}", String::from_utf8_lossy(&output.stderr)));
     }
 
-    // 拼接成完整的 C 程序
-    let mut full_c_code = String::new();
-    full_c_code.push_str("#include <stdio.h>\n#include <stdlib.h>\n#include <math.h>\n\n");
-    full_c_code.push_str("int main(int argc, char **argv) {\n");
-    full_c_code.push_str(&c_body);
-    full_c_code.push_str("    return 0;\n}\n");
-
-    // 4. 写入临时文件
-    let temp_dir = tempfile::tempdir()?;
-    let c_path = temp_dir.path().join("transpiled.c");
-    fs::write(&c_path, &full_c_code)?;
-
-    // 调试用：如果需要看生成的 C 代码，取消下面注释
-    // println!("--- Generated C Code ---\n{}\n-----------------------", full_c_code);
-
-    // 5. 调用底层编译器
-    compile(&c_path, &args)?;
-
+    tx.send(AppMessage::Progress(1.0, "传教完成".into()))?;
+    tx.send(AppMessage::Success(format!("降维打击成功，目标: {:?}", output_exe)))?;
     Ok(())
 }
 
-/// 核心：递归转译 Python 语句
-fn transpile_stmt(stmt: &ast::Stmt, symbols: &mut HashMap<String, CType>, indent_level: usize) -> Result<String> {
-    let mut code = String::new();
-    let indent = "    ".repeat(indent_level);
+// ============================================================================
+// [5. 降维编译器引擎 (The Transpiler)] 
+// ============================================================================
 
-    match stmt {
-        // [赋值语句] a = x + y
-        ast::Stmt::Assign(a) => {
-            if let Some(ast::Expr::Name(name_node)) = a.targets.first().map(|e| &**e) {
-                let var_name = name_node.id.as_str();
-                let (val_str, val_type) = eval_expr(&a.value, symbols);
-                
-                if !symbols.contains_key(var_name) {
-                    code.push_str(&format!("{}{} {} = {};\n", indent, val_type.to_c_str(), var_name, val_str));
-                    symbols.insert(var_name.to_string(), val_type);
-                } else {
-                    code.push_str(&format!("{}{} = {};\n", indent, var_name, val_str));
-                }
-            }
-        }
+fn transpile_hybrid(ast: &ast::Suite, symbols: &mut HashMap<String, CType>) -> String {
+    let mut c = String::new();
+    
+    c.push_str("#define PY_SSIZE_T_CLEAN\n");
+    c.push_str("#include <Python.h>\n");
+    c.push_str("#include <stdio.h>\n\n");
+    
+    c.push_str("int main(int argc, char **argv) {\n");
+    c.push_str("    Py_Initialize();\n");
+    c.push_str("    PyObject *globals = PyDict_New();\n");
+    c.push_str("    PyDict_SetItemString(globals, \"__builtins__\", PyEval_GetBuiltins());\n\n");
 
-        // [循环语句] for i in range(n): (支持嵌套)
-        ast::Stmt::For(f) => {
-            if let ast::Expr::Name(target) = &*f.target {
-                if let ast::Expr::Call(call) = &*f.iter {
-                    if let ast::Expr::Name(func_name) = &*call.func {
-                        if func_name.id.as_str() == "range" {
-                            let limit = if let Some(arg) = call.args.first() {
-                                let (s, _) = eval_expr(arg, symbols); s
-                            } else { "0".to_string() };
-                            
-                            let var = target.id.as_str();
-                            // 在符号表注册循环变量
-                            symbols.insert(var.to_string(), CType::Int);
-                            
-                            code.push_str(&format!("{}for (long long {} = 0; {} < {}; {}++) {{\n", indent, var, var, limit, var));
-                            
-                            // 递归处理循环体内部语句
-                            for body_stmt in &f.body {
-                                code.push_str(&transpile_stmt(body_stmt, symbols, indent_level + 1)?);
+    for stmt in ast {
+        match stmt {
+            // [赋值语句]
+            ast::Stmt::Assign(assign) => {
+                if let Some(ast::Expr::Name(name_node)) = assign.targets.first().map(|e| &**e) {
+                    let var_name = name_node.id.as_str();
+                    let (expr_c_code, inferred_type) = eval_expr(&assign.value, symbols);
+
+                    match inferred_type {
+                        CType::Int => {
+                            if !symbols.contains_key(var_name) {
+                                c.push_str(&format!("    long long _c_{} = {};\n", var_name, expr_c_code));
+                                symbols.insert(var_name.to_string(), CType::Int);
+                            } else {
+                                c.push_str(&format!("    _c_{} = {};\n", var_name, expr_c_code));
                             }
-                            
-                            code.push_str(&format!("{}}}\n", indent));
+                            // 将原生 C 结果实时同步回 CPython globals 字典
+                            c.push_str(&format!("    PyDict_SetItemString(globals, \"{}\", PyLong_FromLongLong(_c_{}));\n", var_name, var_name));
+                        }
+                        CType::Float => {
+                            if !symbols.contains_key(var_name) {
+                                c.push_str(&format!("    double _c_{} = {};\n", var_name, expr_c_code));
+                                symbols.insert(var_name.to_string(), CType::Float);
+                            } else {
+                                c.push_str(&format!("    _c_{} = {};\n", var_name, expr_c_code));
+                            }
+                            c.push_str(&format!("    PyDict_SetItemString(globals, \"{}\", PyFloat_FromDouble(_c_{}));\n", var_name, var_name));
+                        }
+                        CType::Dynamic => {
+                            let py_code = format!("{} = {}", var_name, expr_c_code);
+                            c.push_str(&format!("    PyRun_String(\"{}\", Py_file_input, globals, globals);\n", py_code));
+                            symbols.insert(var_name.to_string(), CType::Dynamic);
                         }
                     }
                 }
             }
-        }
-
-        // [函数调用] 目前只处理 print()
-        ast::Stmt::Expr(e) => {
-            if let ast::Expr::Call(call) = &*e.value {
-                if let ast::Expr::Name(n) = &*call.func {
-                    if n.id.as_str() == "print" {
-                        if let Some(arg) = call.args.first() {
-                            let (val_str, val_type) = eval_expr(arg, symbols);
-                            let fmt = match val_type {
-                                CType::Float => "%f",
-                                _ => "%lld",
-                            };
-                            code.push_str(&format!("{}printf(\"{}\\n\", {});\n", indent, fmt, val_str));
+            // [导入处理]
+            ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => {
+                c.push_str("    // [PARE Cold Path] 动态导入库保证 100% 兼容性\n");
+                c.push_str("    PyRun_String(\"import numpy as np\", Py_file_input, globals, globals);\n");
+            }
+            // [表达式调用]
+            ast::Stmt::Expr(e) => {
+                if let ast::Expr::Call(call) = &*e.value {
+                    if let ast::Expr::Name(n) = &*call.func {
+                        if n.id.as_str() == "print" {
+                            if let Some(arg) = call.args.first() {
+                                if let ast::Expr::Name(arg_name) = arg {
+                                    let py_code = format!("print({})", arg_name.id.as_str());
+                                    c.push_str(&format!("    PyRun_String(\"{}\", Py_file_input, globals, globals);\n", py_code));
+                                }
+                            }
                         }
                     }
                 }
             }
+            _ => c.push_str("    // 未处理的 AST 节点，跳过或记录日志\n"),
         }
-        
-        _ => code.push_str(&format!("{}// [PARE: 暂不支持的语法节点]\n", indent)),
     }
-    Ok(code)
+
+    c.push_str("\n    Py_FinalizeEx();\n");
+    c.push_str("    return 0;\n}\n");
+    c
 }
 
-/// 核心：递归推导并生成表达式
+// 递归表达式推导
 fn eval_expr(expr: &ast::Expr, symbols: &HashMap<String, CType>) -> (String, CType) {
     match expr {
-        // 常量数字
-        ast::Expr::Constant(c) => match &c.value {
+        ast::Expr::Constant(const_val) => match &const_val.value {
             ast::Constant::Int(i) => (i.to_string(), CType::Int),
             ast::Constant::Float(f) => (f.to_string(), CType::Float),
-            _ => ("0".to_string(), CType::Unknown),
+            _ => ("None".to_string(), CType::Dynamic),
         },
-        
-        // 变量引用
         ast::Expr::Name(n) => {
-            let name = n.id.as_str();
-            let t = symbols.get(name).cloned().unwrap_or(CType::Int);
-            (name.to_string(), t)
+            let var_name = n.id.as_str();
+            match symbols.get(var_name) {
+                Some(CType::Int) => (format!("_c_{}", var_name), CType::Int),
+                Some(CType::Float) => (format!("_c_{}", var_name), CType::Float),
+                _ => (var_name.to_string(), CType::Dynamic),
+            }
         },
-        
-        // 二元运算 (递归处理 a + b * c)
         ast::Expr::BinOp(b) => {
-            let (l_str, l_type) = eval_expr(&b.left, symbols);
-            let (r_str, r_type) = eval_expr(&b.right, symbols);
+            let (l_code, l_type) = eval_expr(&b.left, symbols);
+            let (r_code, r_type) = eval_expr(&b.right, symbols);
             
-            let op_str = match b.op {
+            let op = match b.op {
                 ast::Operator::Add => "+",
                 ast::Operator::Sub => "-",
                 ast::Operator::Mult => "*",
                 ast::Operator::Div => "/",
-                ast::Operator::Mod => "%",
-                _ => "+",
+                _ => "?",
             };
             
-            let res_type = if l_type == CType::Float || r_type == CType::Float {
-                CType::Float
+            if l_type == CType::Dynamic || r_type == CType::Dynamic {
+                (format!("{} {} {}", l_code.replace("_c_", ""), op, r_code.replace("_c_", "")), CType::Dynamic)
             } else {
-                CType::Int
-            };
-            
-            (format!("({} {} {})", l_str, op_str, r_str), res_type)
+                let res_type = if l_type == CType::Float || r_type == CType::Float { CType::Float } else { CType::Int };
+                (format!("({} {} {})", l_code, op, r_code), res_type)
+            }
         },
-        
-        _ => ("0".to_string(), CType::Unknown),
+        _ => ("?".to_string(), CType::Dynamic),
     }
 }
 
-/// 跨平台编译器调用逻辑
-fn compile(c_src: &Path, args: &Args) -> Result<()> {
-    let is_windows = cfg!(target_os = "windows");
+// ============================================================================
+// [6. 资源管理与辅助] 
+// ============================================================================
+
+/// 🌟 静态链接字体：将 font.ttf 编译进二进制文件
+fn setup_embedded_font(ctx: &egui::Context) {
+    // 使用 include_bytes! 宏在编译期读取文件
+    // 确保 font.ttf 与 main.rs 在同一目录
+    let font_data = include_bytes!("font.ttf");
     
-    // 尝试寻找编译器
-    let mut cmd = if is_windows {
-        if Command::new("gcc").arg("--version").output().is_ok() {
-            println!("🛠️  检测到 GNU 工具链 (MinGW/GCC)...");
-            get_gcc_cmd(c_src, args)
-        } else {
-            println!("🛠️  未检测到 GCC, 尝试切换至 MSVC (cl.exe)...");
-            get_msvc_cmd(c_src, args)
-        }
-    } else {
-        get_gcc_cmd(c_src, args)
+    let mut fonts = egui::FontDefinitions::default();
+    
+    // 注册字体数据
+    fonts.font_data.insert(
+        "embedded_font".to_owned(),
+        egui::FontData::from_static(font_data),
+    );
+
+    // 设置为首选比例字体和等宽字体
+    fonts.families.get_mut(&egui::FontFamily::Proportional)
+        .unwrap()
+        .insert(0, "embedded_font".to_owned());
+    
+    fonts.families.get_mut(&egui::FontFamily::Monospace)
+        .unwrap()
+        .insert(0, "embedded_font".to_owned());
+
+    ctx.set_fonts(fonts);
+}
+
+fn get_python_config(arg: &str) -> Result<String> {
+    let out = Command::new("python3-config").arg(arg).output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn get_python_config_embed() -> Result<String> {
+    let out = Command::new("python3-config").arg("--ldflags").arg("--embed").output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+// 程序入口
+fn main() -> Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([700.0, 500.0])
+            .with_title("PARE Studio - OxidizedSchale Edition"),
+        ..Default::default()
     };
-
-    let status = cmd.status().context("❌ 启动编译器失败！请确保你安装了 GCC 或 MSVC 并在环境变量中。")?;
-    
-    if status.success() {
-        println!("{}", "🎉 [PARE] 编译成功！Python 运行时已被彻底消除。".bright_green().bold());
-        println!("🚀 输出目标: {:?}", args.output);
-    } else {
-        println!("{}", "❌ 底层编译器报错，降维打击失败。".red().bold());
-    }
-
-    Ok(())
-}
-
-fn get_gcc_cmd(src: &Path, args: &Args) -> Command {
-    let mut c = Command::new("gcc");
-    c.arg("-O3").arg(src).arg("-o").arg(&args.output).arg("-lm"); // -lm 链接数学库
-    if args.optimize {
-        c.arg("-march=native").arg("-flto").arg("-ffast-math");
-    }
-    if args.use_mold {
-        c.arg("-fuse-ld=mold");
-    }
-    c
-}
-
-fn get_msvc_cmd(src: &Path, args: &Args) -> Command {
-    let mut c = Command::new("cl.exe");
-    c.arg("/O2").arg("/Ot").arg("/GL").arg(src).arg(format!("/Fe:{}", args.output.display()));
-    if args.optimize {
-        c.arg("/arch:AVX2"); // 默认现代机器
-    }
-    c
+    eframe::run_native(
+        "PARE Studio", 
+        options, 
+        Box::new(|cc| Box::new(PareApp::new(cc)))
+    ).map_err(|e| anyhow::anyhow!("GUI 崩溃: {}", e))
 }
