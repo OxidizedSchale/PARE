@@ -70,7 +70,9 @@ PARE is a tool for the people. If you use it to build the future, the future mus
 
 PARE 是属于人民的工具。如果你用它构建未来，那么未来必须保持开放。
 # 🤝 Join the Cult of Speed / 加入速度神教
-If you believe Python is a great language trapped in a slow body, join us. 如果你相信 Python 是一门被困在缓慢躯体里的伟大语言，请加入我们。
+If you believe Python is a great language trapped in a slow body, join us. 
+
+如果你相信 Python 是一门被困在缓慢躯体里的伟大语言，请加入我们。
 
 PARE's Accelerated Runtime Elimination - Pure Speed, No Bullshit.
 
