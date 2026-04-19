@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * Project: PARE Studio (PARE's Accelerated Runtime Elimination)
- * Version: 0.2.0-Alpha "Pure C Strike"
+ * Version: 0.1.0-beta "Pure C Strike"
  * GitHub: https://github.com/OxidizedSchale/PARE-s-Accelerated-Runtime-Elimination
  * * [核心架构说明 / Architectural Vision]
  * PARE 不仅仅是一个打包工具，它是一个“运行时消除器”。
@@ -14,7 +14,7 @@
  * 仅在必须调用 Python 侧功能（如 print 或 import）前，才将 C 状态“刷”回 
  * CPython VM 的 globals 字典中。
  * * 版权所有 (C) 2026 OxidizedSchale & PARE Contributors
- * 许可证: GNU General Public License v3.0 (自由是强制性的)
+ * 许可证: GNU Affero General Public License v3.0 (自由是强制性的)
  * ============================================================================
  */
 
